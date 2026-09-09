@@ -434,3 +434,7 @@ Agent SDK 是 Claude Code 的库形态：`query()` 启动包内的 CLI 二进制
 | 订阅政策 | support.claude.com/en/articles/15036540 |
 | 提示缓存 | platform.claude.com/docs/en/build-with-claude/prompt-caching |
 | thinking 的 `display` 字段与跨轮保留 | platform.claude.com/docs/en/build-with-claude/thinking |
+
+## 许可
+
+本仓库（正文与代码）以 MIT 许可发布，见 [LICENSE](LICENSE)。
