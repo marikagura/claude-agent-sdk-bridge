@@ -154,7 +154,7 @@ for await (const m of query({
     abortController: abort,                        // 15 分钟上限
     env,
     tools: ["Bash", "Read", "Write", "Edit", "WebSearch", "WebFetch", "ToolSearch", "TaskOutput", "TaskStop"],
-    mcpServers: { kimi: { ...fromMcpJson, url: fromMcpJson.url + "?profile=chat" }, ...inProcessServers },
+    mcpServers: { store: { ...fromMcpJson, url: fromMcpJson.url + "?profile=chat" }, ...inProcessServers },
     strictMcpConfig: true,
     canUseTool: async (name, input) =>
       toolAllowed(name)
@@ -197,7 +197,7 @@ export const watch = createSdkMcpServer({
     })),
   ],
 });
-// 挂载：mcpServers: { kimi: {...}, watch }，与远端 server 在同一张表
+// 挂载：mcpServers: { store: {...}, watch }，与远端 server 在同一张表
 ```
 
 ## 6. 事件流的处理
@@ -250,12 +250,12 @@ canUseTool: async (name, input) =>
 
 **`settingSources` 不含 `local`。** `.claude/settings.local.json` 中的 `permissions.allow` 规则在 settings 层放行工具，被放行的调用不会到达 `canUseTool`。该文件是交互窗口减少弹窗的配置，与本出口无关；本实现的规则是回调为唯一裁判。
 
-**判据为前缀。** 内置工具已经由 `tools` 限定，回调对不带 `mcp__` 前缀的名称一律放行；MCP 工具按 server 前缀判断（`mcp__kimi__`、`mcp__watch__` 等）。SDK 新增内置工具时不需要修改回调。
+**判据为前缀。** 内置工具已经由 `tools` 限定，回调对不带 `mcp__` 前缀的名称一律放行；MCP 工具按 server 前缀判断（`mcp__store__`、`mcp__watch__` 等）。SDK 新增内置工具时不需要修改回调。
 
 **拒绝理由可以包含正确的调用方式。** 某个工具的全量返回约 100KB，超过 CLI 的字节上限后会被存为文件而无法读取（第 13 节）。回调拒绝不带分页参数的调用，理由中写明分页方式，模型按理由重新调用：
 
 ```js
-if (name === "mcp__kimi__reentry" && input.coreOnly !== true && typeof input.offset !== "number") {
+if (name === "mcp__store__context" && input.brief !== true && typeof input.offset !== "number") {
   return { behavior: "deny", message:
     "全量返回约 100KB 会被存为文件而无法读取。请分块：先 offset=0（limit 不传，由服务端按默认大小裁块），再按块尾提示的 offset 连续读取到 [完]。" };
 }
@@ -465,6 +465,21 @@ const switched =
 留空的模型不拦截：按猜测的数字拦截会在没有依据的情况下挡下本可成功的请求。上游拒绝在数秒内返回，此时可把那句英文换成可读的说明，并记录被拒时的上下文大小，作为以后填表的上界。
 
 **换模型的那一轮对使用者可见。** 判断方式是读转写末轮 API 返回的模型 id，与这一轮要用的 id 各自归一化后比较——去掉 `claude-` 前缀、`[1m]` 后缀与末尾的日期版本；未归一化会把 `claude-opus-4-6[1m]` 与 API 返回的 `claude-opus-4-6` 判成两个模型，从而每一轮都提示。不同即在这一轮的事件流里插入一条说明，告知这一轮会重写整段前缀。若该模型在同一 session 上一小时内使用过，说明改为「可能仍然命中」：缓存是否已被其他 session 挤出无法在本地判断，措辞不作保证。首轮（尚无 session id）不提示。
+**斜杠命令可以更换模型，作用范围是进程。** 斜杠命令作为普通 prompt 发送、由 CLI 在本地识别（第 13 节）。`/model <id>` 被接受并立即生效：该轮不产生上游请求，`num_turns` 为 0、`usage` 各项为零，返回一条 `model` 为 `<synthetic>` 的消息；同一进程的后续轮次使用新模型，并重新发出一条 `system/init`。2026-09-18 的一次实测，以流式输入在单个进程内连发两轮：
+
+```
+init      claude-sonnet-5
+assistant <synthetic>                "Set model to `Haiku 4.5` for this session only"  turns=0 cost=0
+init      claude-haiku-4-5-20251001  ← 同一进程，后续轮次已换
+assistant claude-haiku-4-5-20251001
+```
+
+**每轮启动一个进程的部署中，`model` 参数覆盖它。** 本实现每收到一条消息启动一次 `query()`，`model` 由别名表展开后随 argv 传入。前端发出的 `/model` 因此只作用于它自己那一轮，下一轮的新进程按 argv 取模型。要让这类命令生效，需在启动子进程前拦下它，把目标 id 记为该会话的覆盖值，后续轮次以该值替代别名表的结果；命令不带参数时撤销覆盖。此外新模型 id 需要足够新的内置 CLI（第 16 节），命令本身不能绕过这一前提。
+
+**不传 `model` 时，resume 恢复的是转写中上一轮真实回复的模型。** 转写没有独立的模型状态字段，模型只记录在每条 assistant 消息上。同一实测中：转写已有真实回复时，resume 沿用该回复的模型；session 内只有 `<synthetic>` 轮次而无真实回复时，回落到配置的默认模型。显式传入 `model` 则以传入值为准，与转写无关。
+
+**headless 的对应接口是 `setModel()`。** 控制协议的 `setModel()`（第 2 节）与斜杠命令的作用范围相同：当前进程内生效，同样重新发出 `system/init`。两者都不提供「下一次 resume 用哪个模型」的持久设置，该设置属于启动参数。
+
 
 ## 15. 故障对照
 
@@ -486,6 +501,7 @@ const switched =
 | 续期探针失败，日志里只看到那行 stdin 警告 | 真实原因排在该行之后，被日志截断挤出 | 取原因前按行滤掉该警告并带上 exit code；连续三次失败要告警，refresh token 过期只能在本机重新登录 |
 | 网关重启后工人推送得到 410、客户端轮询得到 404 | 该轮任务只存在于内存（较早的那条线路） | 工人以完整快照走孤儿收尾落库，客户端改拉落库全文；持久化那条线不受影响 |
 | 工人反复重送同一份收尾快照 | 收尾接口回了 409 | 收尾用 200 / 202 / 410 三种回应：202 表示继续重送，410 表示停止重送，409 会导致无限重试 |
+| 前端发出的 `/model` 未改变后续轮次的模型 | 每轮启动新进程，argv 的 `model` 覆盖进程内的更换 | 在启动子进程前拦下该命令，记为该会话的覆盖值；见第 14 节 |
 
 ## 16. 版本
 
