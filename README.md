@@ -17,7 +17,7 @@
 
 以下内容核对自 SDK 包内的 `sdk.mjs`（0.3.258）与一次实测。
 
-**同一个二进制。** SDK 包依赖一个平台包（macOS arm64 为 `@anthropic-ai/claude-agent-sdk-darwin-arm64`），其中是一份 Claude Code 二进制，版本与 SDK 对应（0.3.258 对应 2.1.258）。`query()` 启动的就是这份二进制；`pathToClaudeCodeExecutable` 可以指向另一份。它与终端里安装的 CLI 是两份文件，版本可能不同（本机终端为 2.1.266）。
+**同一个二进制。** SDK 包依赖一个平台包（macOS arm64 为 `@anthropic-ai/claude-agent-sdk-darwin-arm64`），其中是一份 Claude Code 二进制，版本与 SDK 对应（0.3.258 对应 2.1.258）。`query()` 启动的就是这份二进制；`pathToClaudeCodeExecutable` 可以指向另一份。它与终端里安装的 CLI 是两份文件，版本可能不同（本机终端为 2.1.278）。指向终端那一份会改变升级路径，见第 16 节。
 
 **固定参数，不含 `-p`。** `query()` 对每个子进程固定传入：
 
@@ -474,7 +474,17 @@ init      claude-haiku-4-5-20251001  ← 同一进程，后续轮次已换
 assistant claude-haiku-4-5-20251001
 ```
 
-**每轮启动一个进程的部署中，`model` 参数覆盖它。** 本实现每收到一条消息启动一次 `query()`，`model` 由别名表展开后随 argv 传入。前端发出的 `/model` 因此只作用于它自己那一轮，下一轮的新进程按 argv 取模型。要让这类命令生效，需在启动子进程前拦下它，把目标 id 记为该会话的覆盖值，后续轮次以该值替代别名表的结果；命令不带参数时撤销覆盖。此外新模型 id 需要足够新的内置 CLI（第 16 节），命令本身不能绕过这一前提。
+**每轮启动一个进程的部署中，`model` 参数覆盖它。** 本实现每收到一条消息启动一次 `query()`，`model` 由别名表展开后随 argv 传入。前端发出的 `/model` 因此只作用于它自己那一轮，下一轮的新进程按 argv 取模型。要让这类命令生效，需在启动子进程前拦下它，把目标 id 记为该会话的覆盖值，后续轮次以该值替代别名表的结果；命令不带参数时撤销覆盖。此外新模型 id 需要足够新的 CLI（第 16 节），命令本身不能绕过这一前提。
+
+**本实现的会话级覆盖。** 2026-09-19 按上一段实现：取到任务后先解析文本，`/model` 与 `/cli` 在启动子进程之前处理完毕并直接返回结果，其余斜杠命令（`/compact`）照原样进入子进程。三点值得单独说明。
+
+其一，**先探测再接受**。写入覆盖值之前，用同一份 CLI 起一轮最小请求（`-p ok --model <id> --max-turns 1 --no-session-persistence --setting-sources user --output-format json`），确认这台机器的 CLI 认识这个 id。判据是「有没有真的产出文本」：`is_error` 为假、`usage.output_tokens` 大于零、正文非空。不认识的 id 在 2.1.278 上返回 `is_error: true`、`usage` 全零、正文为一句说明（`There's an issue with the selected model (…). It may not exist or you may not have access to it.`）；较旧的 CLI 则是 `subtype` 仍为 `success` 而错误文本落在正文（第 15 节）。两种形状不同，同一个判据都能覆盖。探测这一轮不写入会话，成本是一次最小请求。
+
+其二，**覆盖值存在工作目录之外**。本实现写 `~/.p-bridge.models.json`，形状为 `{ threads: { <会话 id>: { model, at } } }`，每次读取按 mtime 判断是否重新载入。放在工作目录内会改动工作树，而工作树的状态进入系统提示，一次改动即造成下一轮整段前缀重写（第 9 节）。按 mtime 重载的附带作用是这个文件可以由别的进程改写，不必只经由命令。
+
+其三，**覆盖之后另外两张表要按真实 id 查**。思考档位表与窗口表原先以别名为键；覆盖值是一个别名表里没有的 id，查不到时的处理是放行调用方所选的档位（上游不接受会当场拒绝，可见），窗口无记录则不拦截（本节前文）。
+
+**`supportedModels()` 不能用来发现新模型。** 控制协议的 `supportedModels()` 返回的是模型选单的那几行——2026-09-19 在 2.1.258 与 2.1.278 上均为 5 行（`default`、`opus[1m]`、`claude-fable-5-1[1m]`、`sonnet`、`haiku`），其中 `default` 另有 `resolvedModel` 指向实际模型。选单之外的具体 id（带日期版本的、尚未进入选单的）不在其中，但作为 `model` 传入是接受的。判断一个 id 可不可用只能实际请求一次。
 
 **不传 `model` 时，resume 恢复的是转写中上一轮真实回复的模型。** 转写没有独立的模型状态字段，模型只记录在每条 assistant 消息上。同一实测中：转写已有真实回复时，resume 沿用该回复的模型；session 内只有 `<synthetic>` 轮次而无真实回复时，回落到配置的默认模型。显式传入 `model` 则以传入值为准，与转写无关。
 
@@ -488,7 +498,7 @@ assistant claude-haiku-4-5-20251001
 | 每轮报错，日志 `401 OAuth access token has expired` | 登录态过期 | 终端运行 `claude` 重新登录；daemon 不需重启 |
 | 工具调用失败，日志 `ZodError: invalid_union` | `canUseTool` 的 allow 未携带 `updatedInput` | `{ behavior: "allow", updatedInput: input }` |
 | 新增的 MCP 工具被拒绝，旧工具正常 | 旧工具被 settings 层的 allow 规则放行，新工具才到达回调 | `settingSources` 去掉 `local`，使回调成为唯一裁判 |
-| 某模型返回 `400 … does not support this model; version X or newer is required`，usage 全零 | SDK 内置的 CLI 版本过旧；`result.subtype` 仍为 `success`，错误文本在正文中 | 升级 `@anthropic-ai/claude-agent-sdk`；探测时以是否返回文本为准 |
+| 某模型返回 `400 … does not support this model; version X or newer is required`，或 `It may not exist or you may not have access to it`，usage 全零 | CLI 版本过旧，不认识这个 id。前者 `result.subtype` 仍为 `success`、错误文本在正文；后者（2.1.278）`is_error` 为真 | 升级所起的那份 CLI（第 16 节）；探测时一律以「是否返回文本」为准，不看 `subtype` |
 | 思考面板为空 | usage 中 `thinking_tokens` 为 0 时模型未思考；大于 0 而文本为空时是 `display` 默认 `omitted`（4.7 起） | `thinking.display: "summarized"`；转写中的整块 thinking 可作补充来源 |
 | 一轮数分钟无输出 | 冷 resume 的 prefill、compact，或上游 `api_retry` | 先查日志中的 `api_retry`，再查转写末条 usage 的 `cache_read` 是否为 0 |
 | 一次 commit 之后下一轮延迟约 40 秒 | 系统提示中的 git 状态变化，整段缓存未命中 | 第 9 节 |
@@ -505,7 +515,11 @@ assistant claude-haiku-4-5-20251001
 
 ## 16. 版本
 
-- SDK 内置的 CLI 与终端安装的 CLI 是两份文件（0.3.258 内置 2.1.258，本机终端 2.1.266）。新模型 id 需要新版 CLI（`claude-fable-5-1` 要求 ≥ 2.1.251），升级对象是 npm 包，不是 `claude update`。
+**起哪一份 CLI 决定升级路径。** SDK 内置的 CLI 与终端安装的 CLI 是两份文件（0.3.258 内置 2.1.258；本机终端 2.1.278）。新模型 id 需要足够新的 CLI（`claude-fable-5-1` 要求 ≥ 2.1.251），所以「升级」这件事的对象取决于 `query()` 起的是哪一份：默认起内置那份，升级对象是 npm 包，需要改依赖并重新部署；以 `pathToClaudeCodeExecutable` 指向终端那份，升级对象是 `claude update`，不改依赖、不改 lockfile，而每轮启动一个进程的部署连重启都不需要——下一轮启动的就是新版本。回退相应地是 `claude install <版本>`：旧版本保留在 `~/.local/share/claude/versions/`。
+
+本实现 2026-09-19 改为默认指向终端那份，另留一个环境变量切回内置。实测：SDK 0.3.258 配 2.1.266 与 2.1.278，事件流、流式输入的多轮、`thinking`、控制协议与 `supportedModels()` 均正常；`claude update` 从 2.1.266 升到 2.1.278 用时 24 秒。两点代价：这份 CLI 由使用者的终端共用，版本不再随部署固定；SDK 与 CLI 的版本组合脱离了包的对应关系，上面这几组是实测过的范围，跨度更大的组合没有测。
+
+- 升级 CLI 之后核对订阅登录仍然可用：以 `-p` 发一次最小请求，`system/init` 的 `apiKeySource` 为 `none` 即仍在使用登录态（2.1.278 实测）。本实现在每次通过命令升级后自动执行这一检查。
 - `--bare` 将成为 `-p` 的默认，且 bare 模式不读取 OAuth 登录态与 `CLAUDE_CODE_OAUTH_TOKEN`。当前 SDK 不传该参数；升级 SDK 后先运行第 3 节的自检。
 - 白名单替代 `preset` 后新的内置工具不会自动加入；升级后核对 `system/init` 的 `tools` 列表。
 - 升级前以 `persistSession: false` 开一条测试 session，核对事件解析、thinking、权限回调、MCP 连接，通过后再切换。0.3.233 对未知模型 id 返回 400 而 `subtype` 仍为 `success` 的情况即在此类测试中发现。
